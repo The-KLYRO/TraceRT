@@ -1,0 +1,152 @@
+name: Mirror release assets to GitLab
+
+# Runs the release-asset half of the release pipeline on GitLab: when a GitHub
+# release is published, every installer is copied into GitLab's generic package
+# registry and attached to the matching GitLab release as a download link.
+# No build happens here - building stays on GitHub (GitLab free tier only has
+# Linux runners), so GitLab gets the identical set of Windows/macOS/Linux
+# artifacts without spending CI minutes.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to mirror (e.g. v1.1.0). Leave empty for the latest published release."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mirror-release-${{ github.repository }}-${{ github.event.release.tag_name || inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  mirror:
+    name: Mirror release assets
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}
+      GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+      GL_API: "https://gitlab.com/api/v4"
+      RELEASE_FILE: /tmp/gh-release.json
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve tag and GitLab project id
+        id: meta
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.release.tag_name }}"
+          if [ -z "$TAG" ]; then TAG="${{ inputs.tag }}"; fi
+          if [ -z "$TAG" ]; then
+            TAG="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=1" --jq '.[0].tag_name // empty' || true)"
+          fi
+          PID="$(sed -nE 's/^[[:space:]]*projectId:[[:space:]]*([0-9]+).*/\1/p' .github/sync-config.yml | head -n1 || true)"
+          if [ -z "$PID" ]; then
+            echo "::error::projectId not found in .github/sync-config.yml"
+            exit 1
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "pid=${PID}" >> "$GITHUB_OUTPUT"
+          echo "Resolved tag='${TAG}' pid=${PID}"
+
+      - name: No release to mirror
+        if: steps.meta.outputs.tag == ''
+        run: echo "No release tag found on this repository - nothing to mirror."
+
+      - name: Fetch release metadata
+        if: steps.meta.outputs.tag != ''
+        run: |
+          set -euo pipefail
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${{ steps.meta.outputs.tag }}" > "$RELEASE_FILE"
+          echo "Release $(jq -r '.tag_name' "$RELEASE_FILE") has $(jq '.assets | length' "$RELEASE_FILE") asset(s)"
+
+      - name: Ensure GitLab release exists
+        if: steps.meta.outputs.tag != ''
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          PID: ${{ steps.meta.outputs.pid }}
+        run: |
+          set -euo pipefail
+          enc_tag="$(jq -rn --arg t "$TAG" '$t|@uri')"
+          rel_url="${GL_API}/projects/${PID}/releases/${enc_tag}"
+          # gitsync also mirrors tags/releases; if ours arrives first the tag may
+          # not exist yet, so retry while that settles.
+          for attempt in $(seq 1 12); do
+            code="$(curl -sS -o /tmp/rel.out -w '%{http_code}' -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" "$rel_url" || echo 000)"
+            if [ "$code" = "200" ]; then echo "GitLab release ${TAG} already exists"; exit 0; fi
+            if [ "$code" = "404" ]; then
+              echo "GitLab release missing (attempt ${attempt}) - creating"
+              jq -n --arg tag "$TAG" \
+                    --arg name "$(jq -r '.name // ""' "$RELEASE_FILE")" \
+                    --arg desc "$(jq -r '.body // ""' "$RELEASE_FILE")" \
+                    '(if $name == "" then {tag_name: $tag} else {tag_name: $tag, name: $name} end)
+                     + {description: $desc}' > /tmp/newrel.json
+              c2="$(curl -sS -o /tmp/newrel.out -w '%{http_code}' -X POST \
+                    -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -H 'Content-Type: application/json' \
+                    --data-binary @/tmp/newrel.json "$rel_url")"
+              if [ "$c2" = "201" ]; then echo "Created GitLab release ${TAG}"; exit 0; fi
+              echo "create returned ${c2}: $(cat /tmp/newrel.out)"
+            else
+              echo "lookup returned ${code}: $(cat /tmp/rel.out)"
+            fi
+            sleep 15
+          done
+          echo "::error::Could not ensure GitLab release ${TAG} exists"
+          exit 1
+
+      - name: Mirror assets to GitLab
+        if: steps.meta.outputs.tag != ''
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          PID: ${{ steps.meta.outputs.pid }}
+        run: |
+          set -euo pipefail
+          enc_tag="$(jq -rn --arg t "$TAG" '$t|@uri')"
+          links_url="${GL_API}/projects/${PID}/releases/${enc_tag}/assets/links"
+          curl -sS -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" "$links_url" > /tmp/links.json
+          existing="$(jq -r '.[].name // empty' /tmp/links.json)"
+          total=0; mirrored=0; skipped=0
+          while IFS=$'\t' read -r aid aname; do
+            [ -n "$aname" ] || continue
+            total=$((total + 1))
+            if printf '%s\n' "$existing" | grep -Fxq -- "$aname"; then
+              echo "skip (already linked): ${aname}"
+              skipped=$((skipped + 1))
+              continue
+            fi
+            echo "mirroring: ${aname} (asset id ${aid})"
+            gh api -H "Accept: application/octet-stream" \
+              "repos/${GITHUB_REPOSITORY}/releases/assets/${aid}" > "/tmp/${aname}"
+            enc_name="$(jq -rn --arg n "$aname" '$n|@uri')"
+            pkg_url="${GL_API}/projects/${PID}/packages/generic/gh-release-assets/${enc_tag}/${enc_name}"
+            code="$(curl -sS -o /tmp/up.out -w '%{http_code}' -X PUT \
+              -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -H 'Content-Type: application/octet-stream' \
+              --data-binary "@/tmp/${aname}" "$pkg_url")"
+            if [ "$code" != "201" ]; then
+              echo "::error::upload of ${aname} failed (${code}): $(cat /tmp/up.out)"
+              exit 1
+            fi
+            jq -n --arg n "$aname" --arg u "${pkg_url}?download=true" \
+              '{name: $n, url: $u, link_type: "other"}' > /tmp/link.json
+            code="$(curl -sS -o /tmp/lk.out -w '%{http_code}' -X POST \
+              -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -H 'Content-Type: application/json' \
+              --data-binary @/tmp/link.json "$links_url")"
+            if [ "$code" != "201" ]; then
+              echo "::error::link creation for ${aname} failed (${code}): $(cat /tmp/lk.out)"
+              exit 1
+            fi
+            mirrored=$((mirrored + 1))
+          done < <(jq -r '.assets[] | [.id, .name] | @tsv' "$RELEASE_FILE")
+          echo "Mirrored ${mirrored}/${total} asset(s); ${skipped} already present."
